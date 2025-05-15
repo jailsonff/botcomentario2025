@@ -1,0 +1,626 @@
+import time
+import random
+import os
+import pyperclip
+import threading
+from PyQt5.QtCore import QThread, pyqtSignal
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
+
+class AutomacaoComentariosWorker(QThread):
+    """
+    Worker especializado para executar comentários automatizados em posts do Instagram usando perfis do Dolphin Anty.
+    """
+    # Sinais: perfil, ação, sucesso, mensagem
+    acao_concluida = pyqtSignal(str, str, bool, str)
+    progresso_atualizado = pyqtSignal(int, int)  # ações concluídas, total de ações
+    status_update = pyqtSignal(str)
+    automacao_concluida = pyqtSignal()
+
+    def __init__(self, dolphin_manager, post_url, perfis, total_acoes, perfis_simultaneos, 
+                 tempo_entre_acoes, texto_comentario="", parent=None, manter_navegador_aberto=False):
+        super().__init__(parent)
+        self.dolphin_manager = dolphin_manager
+        self.post_url = post_url
+        self.perfis = perfis  # Lista de nomes de usuário dos perfis
+        self.total_acoes = total_acoes
+        self.perfis_simultaneos = perfis_simultaneos
+        self.tempo_entre_acoes = tempo_entre_acoes
+        self.manter_navegador_aberto = manter_navegador_aberto
+        
+        # Tratar o texto_comentario como uma lista de comentários
+        if texto_comentario:
+            # Dividir o texto em linhas e filtrar linhas vazias
+            self.lista_comentarios = [linha.strip() for linha in texto_comentario.split('\n') if linha.strip()]
+        else:
+            self.lista_comentarios = []
+        self._stop_flag = False
+        self.acoes_concluidas = 0
+        self.workers_ativos = {}  # Armazena os drivers ativos por perfil
+
+    def stop(self):
+        """Para a execução da automação."""
+        self._stop_flag = True
+        self.workers_ativos.clear()
+
+    def run(self):
+        """Executa a automação de comentários nos perfis."""
+        if not self.perfis or not self.post_url:
+            self.status_update.emit("❌ Erro: URL do post ou lista de perfis vazia.")
+            self.automacao_concluida.emit()
+            return
+
+        # Verifica se há comentários disponíveis
+        if not self.lista_comentarios:
+            self.status_update.emit("❌ Erro: Nenhum comentário definido.")
+            self.automacao_concluida.emit()
+            return
+
+        # Verifica se o número de ações é maior que o número de perfis disponíveis
+        if self.total_acoes > len(self.perfis):
+            self.status_update.emit(f"⚠️ Aviso: O número de ações ({self.total_acoes}) é maior que o número de perfis disponíveis ({len(self.perfis)}). Alguns perfis serão usados mais de uma vez.")
+
+        # Embaralha a lista de perfis para usar em ordem aleatória
+        perfis_disponiveis = self.perfis.copy()
+        random.shuffle(perfis_disponiveis)
+
+        # Inicia o loop de automação
+        self.acoes_concluidas = 0
+        self.progresso_atualizado.emit(self.acoes_concluidas, self.total_acoes)
+        
+        # Criar um lock para acesso thread-safe à variável acoes_concluidas
+        self.acoes_lock = threading.Lock()
+        
+        # Criar uma lista para controlar os perfis já usados
+        self.perfis_em_execucao = []
+        
+        while self.acoes_concluidas < self.total_acoes and not self._stop_flag:
+            # Verifica quantos workers estão ativos no momento
+            workers_ativos_count = len(self.workers_ativos)
+            
+            # Se já temos o máximo de workers ativos, aguarda
+            if workers_ativos_count >= self.perfis_simultaneos:
+                time.sleep(1)
+                continue
+            
+            # Verificar quantas ações já foram iniciadas (em execução + concluídas)
+            with self.acoes_lock:
+                acoes_em_andamento = len(self.perfis_em_execucao)
+                acoes_totais_iniciadas = acoes_em_andamento + self.acoes_concluidas
+                
+                # Se já iniciamos todas as ações necessárias, apenas aguarda a conclusão
+                if acoes_totais_iniciadas >= self.total_acoes:
+                    time.sleep(1)
+                    continue
+            
+            # Selecionar próximo perfil disponível
+            perfil_escolhido = None
+            for perfil in perfis_disponiveis:
+                if perfil not in self.perfis_em_execucao and perfil not in self.workers_ativos:
+                    perfil_escolhido = perfil
+                    break
+            
+            # Se não encontrou perfil disponível, tentar reutilizar um perfil
+            if not perfil_escolhido and self.total_acoes > len(self.perfis):
+                # Verificar quais perfis já foram usados mas não estão ativos no momento
+                perfis_ja_usados = [p for p in self.perfis if p not in self.perfis_em_execucao and p not in self.workers_ativos]
+                if perfis_ja_usados:
+                    perfil_escolhido = random.choice(perfis_ja_usados)
+            
+            # Se ainda não encontrou perfil, aguardar
+            if not perfil_escolhido:
+                time.sleep(1)
+                continue
+            
+            # Adicionar perfil à lista de perfis em execução
+            self.perfis_em_execucao.append(perfil_escolhido)
+            
+            # Iniciar thread para executar a ação neste perfil
+            self.status_update.emit(f"🚀 Iniciando ação com perfil '{perfil_escolhido}'")
+            threading.Thread(target=self._executar_acao_perfil, args=(perfil_escolhido,)).start()
+            
+            # Aguardar intervalo entre ações
+            intervalo = random.uniform(self.tempo_entre_acoes * 0.8, self.tempo_entre_acoes * 1.2)  # Variação de ±20%
+            self.status_update.emit(f"⏱️ Aguardando {intervalo:.1f} segundos antes da próxima ação...")
+            time.sleep(intervalo)
+        
+        # Aguardar todos os workers concluírem
+        while self.workers_ativos and not self._stop_flag:
+            self.status_update.emit(f"⌛ Aguardando {len(self.workers_ativos)} workers concluírem...")
+            time.sleep(2)
+        
+        # Emitir sinal de conclusão
+        self.status_update.emit(f"✅ Automação concluída! {self.acoes_concluidas} comentários realizados.")
+        self.automacao_concluida.emit()
+
+    def _executar_acao_perfil(self, username):
+        """Executa a ação para um perfil específico."""
+        if self._stop_flag:
+            if username in self.perfis_em_execucao:
+                self.perfis_em_execucao.remove(username)
+            return
+        
+        # Tentar obter um comentário aleatório
+        if not self.lista_comentarios:
+            self.status_update.emit(f"❌ Erro: Lista de comentários vazia para '{username}'.")
+            if username in self.perfis_em_execucao:
+                self.perfis_em_execucao.remove(username)
+            return
+        
+        comentario = random.choice(self.lista_comentarios)
+        
+        self.status_update.emit(f"🔄 Iniciando navegador para '{username}'...")
+        
+        # Iniciar navegador e abrir post
+        success, message = self.dolphin_manager.launch_profile_instagram(username, go_to_instagram_home=False)
+        
+        if not success:
+            self.status_update.emit(f"❌ Erro ao abrir navegador para '{username}': {message}")
+            if username in self.perfis_em_execucao:
+                self.perfis_em_execucao.remove(username)
+            return
+        
+        driver = self.dolphin_manager.get_profile_driver(username)
+        if not driver:
+            self.status_update.emit(f"❌ Erro: Driver não encontrado para '{username}'.")
+            if username in self.perfis_em_execucao:
+                self.perfis_em_execucao.remove(username)
+            return
+        
+        # Adicionar à lista de workers ativos
+        self.workers_ativos[username] = driver
+        
+        # Navegar para o post
+        try:
+            self.status_update.emit(f"🌐 Navegando para URL do post ({username})...")
+            driver.get(self.post_url)
+            
+            # Aguardar carregamento da página
+            self._aguardar_carregamento_pagina(driver, username)
+            
+            # Aguardar um tempo para garantir que a página esteja totalmente carregada (crucial para múltiplos perfis)
+            time.sleep(3)
+            
+            # IMPORTANTE: Para perfis múltiplos, precisamos dar foco para este navegador
+            try:
+                driver.execute_script("window.focus();")
+                time.sleep(1)
+                # Mover mouse para o centro da tela para ativação
+                action = ActionChains(driver)
+                action.move_by_offset(0, 0).click().perform()
+                self.status_update.emit(f"👁️ Dando foco ao navegador de '{username}'...")
+                time.sleep(0.5)
+            except Exception as e:
+                self.status_update.emit(f"⚠️ Erro ao ativar navegador: {str(e)}")
+            
+            # Verificar se está logado
+            if not self.dolphin_manager.is_logged_in(driver):
+                self.status_update.emit(f"🔑 Perfil '{username}' não está logado. Tentando login automático...")
+                login_success, login_message = self.dolphin_manager.attempt_login_instagram(
+                    driver, username, "sua_senha_aqui"
+                )
+                
+                if not login_success:
+                    self.status_update.emit(f"❌ Falha no login para '{username}': {login_message}")
+                    driver.quit()
+                    if username in self.workers_ativos:
+                        del self.workers_ativos[username]
+                    if username in self.perfis_em_execucao:
+                        self.perfis_em_execucao.remove(username)
+                    return
+                
+                # Após login bem-sucedido, navegar novamente para o post
+                driver.get(self.post_url)
+                self._aguardar_carregamento_pagina(driver, username)
+            
+            # Lista para rastrear ações realizadas
+            acoes_realizadas = []
+            
+            # Realizar comentário
+            self.status_update.emit(f"💬 Tentando comentar com perfil '{username}'...")
+            comentario_realizado = self._comentar_post(driver, username, comentario, acoes_realizadas)
+            
+            if not comentario_realizado:
+                self.status_update.emit(f"❌ Falha ao comentar com perfil '{username}'.")
+                driver.quit()
+                if username in self.workers_ativos:
+                    del self.workers_ativos[username]
+                if username in self.perfis_em_execucao:
+                    self.perfis_em_execucao.remove(username)
+                return
+            
+        except Exception as e:
+            self.status_update.emit(f"❌ Erro durante execução para '{username}': {str(e)}")
+            driver.quit()
+            if username in self.workers_ativos:
+                del self.workers_ativos[username]
+            if username in self.perfis_em_execucao:
+                self.perfis_em_execucao.remove(username)
+            return
+
+    def _aguardar_carregamento_pagina(self, driver, username):
+        """Aguarda o carregamento da página."""
+        try:
+            self.status_update.emit(f"⏳ Aguardando carregamento da página para '{username}'...")
+            wait = WebDriverWait(driver, 30)
+            wait.until(EC.presence_of_element_located((By.TAG_NAME, "article")))
+            
+            # Reduzido o tempo de espera após carregar o artigo para agilizar o comentário
+            time.sleep(2)  # Tempo suficiente para garantir que podemos interagir com a página
+            
+            # Procurar explicitamente pelo campo de comentário para garantir que está carregado
+            seletores_campo_comentario = [
+                "//form[contains(@class, 'comment')]//textarea",
+                "//textarea[contains(@placeholder, 'coment')]",
+                "//textarea[contains(@aria-label, 'comment')]",
+                "//*[@role='textbox' and contains(@aria-label, 'coment')]",
+                "//*[@placeholder='Adicione um comentário...']",
+                "//*[@placeholder='Add a comment…']"
+            ]
+            
+            for seletor in seletores_campo_comentario:
+                try:
+                    wait.until(EC.presence_of_element_located((By.XPATH, seletor)))
+                    self.status_update.emit(f"✅ Campo de comentário encontrado e pronto para '{username}'")
+                    return  # Encontrou o campo, podemos continuar
+                except:
+                    continue
+            
+            # Se não encontrou o campo, tentar rolar a página
+            driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+            time.sleep(1)
+        except Exception as e:
+            self.status_update.emit(f"⚠️ Erro ao aguardar carregamento: {str(e)}")
+
+    def _comentar_post(self, driver, username, texto_comentario, acoes_realizadas):
+        """Tenta adicionar um comentário ao post."""
+        max_tentativas = 5  # Aumentado o número de tentativas
+        comentario_realizado = False
+        
+        # Apenas dar foco ao navegador antes de interagir, sem rolagem
+        try:
+            # IMPORTANTE: Dar foco ao navegador antes de interagir
+            driver.execute_script("window.focus();")
+            time.sleep(0.5)
+        except Exception as e:
+            self.status_update.emit(f"⚠️ Erro ao ativar navegador: {str(e)}")
+            
+        for tentativa in range(1, max_tentativas + 1):
+            self.status_update.emit(f"💬 Tentativa {tentativa}/{max_tentativas} de comentar com '{username}'...")
+            
+            try:
+                # Identificar o campo de comentário com estratégia mais agressiva
+                seletores_campo_comentario = [
+                    "//form[contains(@class, 'comment')]//textarea",
+                    "//textarea[contains(@placeholder, 'coment')]",
+                    "//textarea[contains(@aria-label, 'comment')]",
+                    "//*[@role='textbox' and contains(@aria-label, 'coment')]",
+                    "//*[@role='textbox']",  # Seletor mais genérico
+                    "//*[@placeholder='Adicione um comentário...']",
+                    "//*[@placeholder='Add a comment…']",
+                    "//form//textarea",  # Qualquer textarea dentro de um form
+                    "//section//textarea",  # Qualquer textarea dentro de section
+                    "//textarea"  # Último recurso: qualquer textarea na página
+                ]
+                
+                campo_comentario = None
+                
+                # Esperar explicitamente pelo campo de comentário
+                try:
+                    wait = WebDriverWait(driver, 10)
+                    for seletor in seletores_campo_comentario:
+                        try:
+                            campo_comentario = wait.until(EC.element_to_be_clickable((By.XPATH, seletor)))
+                            if campo_comentario.is_displayed():
+                                self.status_update.emit(f"✅ Campo de comentário encontrado com seletor: {seletor}")
+                                break
+                        except:
+                            continue
+                except:
+                    pass
+                
+                # Se ainda não encontrou, tentar abordagem tradicional
+                if not campo_comentario:
+                    for seletor in seletores_campo_comentario:
+                        try:
+                            campo_comentario = driver.find_element(By.XPATH, seletor)
+                            if campo_comentario.is_displayed():
+                                self.status_update.emit(f"✅ Campo de comentário encontrado com seletor: {seletor}")
+                                break
+                        except:
+                            continue
+                
+                # Se ainda não encontrou, tentar rolagem em diferentes posições
+                if not campo_comentario:
+                    self.status_update.emit(f"⚠️ Campo de comentário não encontrado. Tentando rolagens diferentes...")
+                    posicoes_rolagem = [100, 300, 500, 800, -100, -300]
+                    
+                    for posicao in posicoes_rolagem:
+                        try:
+                            driver.execute_script(f"window.scrollBy(0, {posicao});")
+                            time.sleep(1)
+                            
+                            for seletor in seletores_campo_comentario:
+                                try:
+                                    campo_comentario = driver.find_element(By.XPATH, seletor)
+                                    if campo_comentario.is_displayed():
+                                        self.status_update.emit(f"✅ Campo de comentário encontrado após rolagem {posicao}px: {seletor}")
+                                        break
+                                except:
+                                    continue
+                            
+                            if campo_comentario and campo_comentario.is_displayed():
+                                break
+                        except:
+                            continue
+                
+                if not campo_comentario:
+                    self.status_update.emit(f"❌ Campo de comentário não encontrado em tentativa {tentativa}")
+                    if tentativa < max_tentativas:
+                        time.sleep(3)
+                        continue
+                    else:
+                        return False
+                
+                # Estratégia 1: Clique e digitação direta com foco garantido
+                try:
+                    # IMPORTANTE: Para múltiplos perfis, precisamos garantir o foco no elemento
+                    driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", campo_comentario)
+                    time.sleep(0.5)
+                    
+                    # Usar JavaScript para destacar o campo visível
+                    driver.execute_script("""
+                        arguments[0].style.border = '2px solid red'; 
+                        arguments[0].style.backgroundColor = '#ffffcc';
+                    """, campo_comentario)
+                    time.sleep(0.5)
+                    
+                    # Limpar o campo usando JavaScript primeiro
+                    driver.execute_script("arguments[0].value = '';", campo_comentario)
+                    
+                    # Clicar usando ActionChains para maior confiabilidade
+                    actions = ActionChains(driver)
+                    actions.move_to_element(campo_comentario).click().perform()
+                    time.sleep(0.5)
+                    
+                    # Tentar digitar com diferentes métodos
+                    campo_comentario.clear()
+                    time.sleep(0.3)
+                    
+                    # Método 1: Envio direto
+                    campo_comentario.send_keys(texto_comentario)
+                    time.sleep(0.5)
+                    
+                    # Método 2: Digitar caractere por caractere
+                    if not campo_comentario.get_attribute("value"):
+                        for char in texto_comentario:
+                            campo_comentario.send_keys(char)
+                            time.sleep(0.05)
+                    
+                    time.sleep(0.5)
+                    
+                    # Tentar enviar comentário
+                    try:
+                        # Método 1: Pressionar Enter usando diferentes abordagens
+                        # Primeiro, verificar se o texto foi inserido corretamente
+                        campo_valor = campo_comentario.get_attribute("value")
+                        self.status_update.emit(f"💬 Texto inserido: '{campo_valor}'")
+                        
+                        # Método 1A: Pressionar Enter diretamente
+                        campo_comentario.send_keys(Keys.ENTER)
+                        time.sleep(1)
+                        
+                        # Método 1B: Usar ActionChains para Enter
+                        if not self._verificar_comentario_enviado(driver, texto_comentario):
+                            actions = ActionChains(driver)
+                            actions.move_to_element(campo_comentario).click().send_keys(Keys.ENTER).perform()
+                            time.sleep(1)
+                        
+                        # Método 1C: Usar JavaScript para submeter o formulário
+                        if not self._verificar_comentario_enviado(driver, texto_comentario):
+                            try:
+                                driver.execute_script("""
+                                    var campo = arguments[0];
+                                    var form = campo.form;
+                                    if (form) form.submit();
+                                """, campo_comentario)
+                                time.sleep(1)
+                            except:
+                                pass
+                            
+                            # Verificar se o comentário foi enviado
+                            if self._verificar_comentario_enviado(driver, texto_comentario):
+                                self.status_update.emit(f"✅ Comentário enviado com sucesso (método Enter)!")
+                                # Finalizar a ação com sucesso
+                                self._finalizar_acao_com_sucesso(driver, username, acoes_realizadas, "comentar")
+                                return True
+                    except:
+                        pass
+                    
+                    # Método 2: Procurar botão de enviar/publicar
+                    try:
+                        botoes_enviar = [
+                            "//button[contains(@type, 'submit')]",
+                            "//button[contains(text(), 'Publicar')]",
+                            "//button[contains(text(), 'Post')]",
+                            "//div[contains(text(), 'Publicar')]/parent::button",
+                            "//div[contains(text(), 'Post')]/parent::button"
+                        ]
+                        
+                        for seletor_botao in botoes_enviar:
+                            try:
+                                botao_publicar = driver.find_element(By.XPATH, seletor_botao)
+                                if botao_publicar.is_displayed() and botao_publicar.is_enabled():
+                                    botao_publicar.click()
+                                    time.sleep(2)
+                                    
+                                    # Verificar se o comentário foi enviado
+                                    if self._verificar_comentario_enviado(driver, texto_comentario):
+                                        self.status_update.emit(f"✅ Comentário enviado com sucesso (método botão)!")
+                                        # Finalizar a ação com sucesso
+                                        self._finalizar_acao_com_sucesso(driver, username, acoes_realizadas, "comentar")
+                                        return True
+                            except:
+                                continue
+                    except:
+                        pass
+{{ ... }}
+                    ActionChains(driver).send_keys(Keys.ENTER).perform()
+                    time.sleep(2)
+                    
+                    # Verificar se o comentário foi enviado
+                    if self._verificar_comentario_enviado(driver, texto_comentario):
+                        self.status_update.emit(f"✅ Comentário enviado com sucesso (método Clipboard)!")
+                        # Fechar o navegador imediatamente após o comentário ser enviado com sucesso
+                        try:
+                            driver.quit()
+                            if username in self.workers_ativos:
+                                del self.workers_ativos[username]
+                            self.status_update.emit(f"🚪 Navegador de '{username}' fechado após comentário bem-sucedido.")
+                        except Exception as e:
+                            self.status_update.emit(f"⚠️ Erro ao fechar navegador: {str(e)}")
+                        return self._atualizar_status_acao_concluida(driver, username, acoes_realizadas, "comentar")
+                except:
+                    pass
+                
+            except Exception as e:
+{{ ... }}
+            
+            # Se não conseguiu comentar, aguarda um pouco antes da próxima tentativa
+            if not comentario_realizado:
+                self.status_update.emit(f"⌛️ Aguardando antes da próxima tentativa...")
+                time.sleep(3)
+        
+        return False
+
+    def _verificar_comentario_enviado(self, driver, texto_comentario):
+        """Verifica se o comentário foi realmente enviado."""
+        try:
+            # Aguardar um momento para o comentário aparecer
+            time.sleep(2)
+            
+            # Verificar 1: O campo de comentário deve estar vazio
+            try:
+                campos_comentario = driver.find_elements(By.XPATH, "//textarea[contains(@placeholder, 'coment')]")
+                for campo in campos_comentario:
+                    if campo.is_displayed() and campo.get_attribute("value") == "":
+                        return True
+            except:
+                pass
+            
+            # Verificar 2: O comentário deve aparecer na lista de comentários
+            try:
+                comentarios = driver.find_elements(By.XPATH, "//ul/li/div[contains(@class, 'comment')]//span")
+                for comentario in comentarios:
+                    if texto_comentario in comentario.text:
+                        return True
+            except:
+                pass
+            
+            # Verificar 3: Verificar mensagem de "Comentário publicado" ou similar
+            try:
+                mensagens = driver.find_elements(By.XPATH, "//*[contains(text(), 'Coment') or contains(text(), 'comment')]")
+                for msg in mensagens:
+                    if "publicado" in msg.text.lower() or "posted" in msg.text.lower():
+                        return True
+            except:
+                pass
+            
+        except Exception as e:
+            self.status_update.emit(f"⚠️ Erro ao fechar navegador: {str(e)}")
+        return self._atualizar_status_acao_concluida(driver, username, acoes_realizadas, "comentar")
+except:
+    pass
+
+def _verificar_comentario_enviado(self, driver, texto_comentario):
+    """Verifica se o comentário foi realmente enviado."""
+    try:
+        # Aguardar um momento para o comentário aparecer
+        time.sleep(2)
+        
+        # Verificar 1: O campo de comentário deve estar vazio
+        try:
+            campos_comentario = driver.find_elements(By.XPATH, "//textarea[contains(@placeholder, 'coment')]")
+            for campo in campos_comentario:
+                if campo.is_displayed() and campo.get_attribute("value") == "":
+                    return True
+        except:
+            pass
+        
+        # Verificar 2: O comentário deve aparecer na lista de comentários
+        try:
+            comentarios = driver.find_elements(By.XPATH, "//ul/li/div[contains(@class, 'comment')]//span")
+            for comentario in comentarios:
+                if texto_comentario in comentario.text:
+                    return True
+        except:
+            pass
+        
+        # Verificar 3: Verificar mensagem de "Comentário publicado" ou similar
+        try:
+            mensagens = driver.find_elements(By.XPATH, "//*[contains(text(), 'Coment') or contains(text(), 'comment')]")
+            for msg in mensagens:
+                if "publicado" in msg.text.lower() or "posted" in msg.text.lower():
+                    return True
+        except:
+            pass
+        
+        return False
+    except Exception as e:
+        self.status_update.emit(f"⚠️ Erro ao verificar comentário: {str(e)}")
+        return False
+
+def _finalizar_acao_com_sucesso(self, driver, username, acoes_realizadas, tipo_acao):
+    """Finaliza uma ação de comentário com sucesso e fecha o navegador imediatamente.
+    
+    Args:
+        driver: WebDriver do Selenium
+        username: Nome do perfil
+        acoes_realizadas: Lista de ações já realizadas
+        tipo_acao: Tipo da ação concluída
+    
+    Returns:
+        bool: True se a ação foi finalizada com sucesso, False caso contrário
+    """
+    # Adicionar à lista de ações realizadas para este perfil
+    acoes_realizadas.append(tipo_acao)
+    
+    # Fechar o navegador imediatamente
+    try:
+        driver.quit()
+        self.status_update.emit(f"🚪 Navegador de '{username}' fechado após comentário bem-sucedido.")
+    except Exception as e:
+        self.status_update.emit(f"⚠️ Erro ao fechar navegador: {str(e)}")
+    
+    # Remover perfil dos workers ativos
+    if username in self.workers_ativos:
+        del self.workers_ativos[username]
+    
+    # Usar lock para garantir acesso thread-safe à variável compartilhada
+    with self.acoes_lock:
+        self.acoes_concluidas += 1
+        # Emitir sinal para atualizar a interface em tempo real
+        self.progresso_atualizado.emit(self.acoes_concluidas, self.total_acoes)
+        # Verificar se atingimos o número total de ações
+        if self.acoes_concluidas >= self.total_acoes:
+            self.status_update.emit(f"✨ Total de ações concluídas! ({self.acoes_concluidas}/{self.total_acoes})")
+            self._stop_flag = True  # Para o bot quando atingir o total de ações
+    
+    # Remover perfil da lista de perfis em execução
+    if username in self.perfis_em_execucao:
+        self.perfis_em_execucao.remove(username)
+    
+    # Notificar conclusão da ação
+    nome_amigavel = "comentário"
+    self.acao_concluida.emit(username, tipo_acao, True, f"{nome_amigavel.capitalize()} realizado com sucesso")
+    self.status_update.emit(f"✅ {nome_amigavel.capitalize()} realizado com perfil '{username}' (Total: {self.acoes_concluidas}/{self.total_acoes})")
+    
+    return True
+
+def _atualizar_status_acao_concluida(self, driver, username, acoes_realizadas, tipo_acao):
+    """Método legado - agora apenas chama _finalizar_acao_com_sucesso."""
+    return self._finalizar_acao_com_sucesso(driver, username, acoes_realizadas, tipo_acao)

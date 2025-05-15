@@ -1,0 +1,26 @@
+{
+    "cores": {
+        "fundo": "#004d40",
+        "controles": "#00695c",
+        "botoes": "#00796b",
+        "texto": "#e0f2f1",
+        "highlight": "#009688",
+        "selection": "#26a69a",
+        "hover": "#4db6ac",
+        "success": "#00bfa5",
+        "error": "#f44336",
+        "warning": "#ffa000",
+        "border": "#b2dfdb",
+        "tab": "#00897b",
+        "progress": "#26a69a"
+    },
+    "espacamentos": {
+        "vertical": 60,
+        "horizontal": 50,
+        "margens": 30
+    },
+    "tamanhos": {
+        "altura_campos": 60,
+        "tamanho_fonte": 20
+    }
+}
